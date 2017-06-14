@@ -66,7 +66,7 @@ final class JarFileResourceLoader extends AbstractResourceLoader implements Iter
     private final URL rootUrl;
     private final String relativePath;
     private final File fileOfJar;
-    private final List<String> directory;
+    private final Directory directory;
 
     // protected by {@code this}
     private final Map<CodeSigners, CodeSource> codeSources = new HashMap<>();
@@ -95,15 +95,8 @@ final class JarFileResourceLoader extends AbstractResourceLoader implements Iter
         } catch (MalformedURLException e) {
             throw new IllegalArgumentException("Invalid root file specified", e);
         }
-        final Enumeration<JarEntry> entries = jarFile.entries();
-        List<String> directory = new ArrayList<>();
-        while (entries.hasMoreElements()) {
-            final JarEntry jarEntry = entries.nextElement();
-            if (! jarEntry.isDirectory()) {
-                directory.add(jarEntry.getName());
-            }
-        }
-        this.directory = directory;
+
+        this.directory = new Directory(jarFile);
     }
 
     private static URI getJarURI(final URI original, final String nestedPath) throws URISyntaxException {
@@ -258,7 +251,7 @@ final class JarFileResourceLoader extends AbstractResourceLoader implements Iter
     public Iterator<Resource> iterateResources(String startPath, final boolean recursive) {
         if (relativePath != null) startPath = startPath.equals("") ? relativePath : relativePath + "/" + startPath;
         final String startName = PathUtils.canonicalize(PathUtils.relativize(startPath));
-        final Iterator<String> iterator = directory.iterator();
+        final Iterator<String> iterator = directory.getFullNameIterator();
         return new Iterator<Resource>() {
             private Resource next;
 
@@ -324,7 +317,7 @@ final class JarFileResourceLoader extends AbstractResourceLoader implements Iter
             }
         }
         // Next just read the JAR
-        extractJarPaths(jarFile, relativePath, index);
+        extractJarPaths(directory, relativePath, index);
 
         if (ResourceLoaders.WRITE_INDEXES && relativePath == null) {
             writeExternalIndex(indexFile, index);
@@ -353,16 +346,12 @@ final class JarFileResourceLoader extends AbstractResourceLoader implements Iter
         }
     }
 
-    static void extractJarPaths(final JarFile jarFile, String relativePath,
+    private static void extractJarPaths(final Directory directory, String relativePath,
             final Collection<String> index) {
         index.add("");
-        final Enumeration<JarEntry> entries = jarFile.entries();
-        while (entries.hasMoreElements()) {
-            final JarEntry jarEntry = entries.nextElement();
-            final String name = jarEntry.getName();
-            final int idx = name.lastIndexOf('/');
-            if (idx == -1) continue;
-            final String path = name.substring(0, idx);
+        Iterator<String> pathIterator = directory.getPathIterator();
+        while (pathIterator.hasNext()) {
+            final String path = pathIterator.next();
             if (path.length() == 0 || path.endsWith("/")) {
                 // invalid name, just skip...
                 continue;
@@ -498,6 +487,109 @@ final class JarFileResourceLoader extends AbstractResourceLoader implements Iter
 
         public int hashCode() {
             return hashCode;
+        }
+    }
+
+    private static class Directory {
+        private final String[] paths;
+
+        private Directory(JarFile jarFile) {
+            List<String> list = new ArrayList<>();
+            final Enumeration<JarEntry> entries = jarFile.entries();
+            Map<String, String> internCache = new HashMap<>();
+            while (entries.hasMoreElements()) {
+                final JarEntry jarEntry = entries.nextElement();
+                String path = jarEntry.getName();
+                String branch, leaf;
+                int idx = path.lastIndexOf('/');
+                if (idx <= 0) {
+                    branch = null;
+                    leaf = intern(path, internCache);
+                } else {
+                    branch = intern(path.substring(0, idx), internCache);
+                    leaf = intern(path.substring(idx), internCache);
+                }
+                list.add(branch);
+                list.add(jarEntry.isDirectory() ? null : leaf);
+            }
+            paths = list.toArray(new String[list.size()]);
+        }
+
+        private Iterator<String> getPathIterator() {
+            return new Iterator<String>() {
+
+                int idx = -2;
+                int last = paths.length - 3;
+
+                @Override
+                public boolean hasNext() {
+                    while (idx < last ) {
+                        if (paths[idx + 2] != null) {
+                            return true;
+                        }
+                        // Next pair didn't have a '/'; skip it
+                        idx += 2;
+                    }
+                    return false;
+                }
+
+                @Override
+                public String next() {
+                    if (!hasNext()) {
+                        throw new NoSuchElementException();
+                    }
+                    idx += 2;
+                    return paths[idx];
+                }
+            };
+        }
+
+        private Iterator<String> getFullNameIterator() {
+            return new Iterator<String>() {
+
+                int idx = -2;
+                int last = paths.length - 3;
+
+                @Override
+                public boolean hasNext() {
+                    while (idx < last ) {
+                        if (paths[idx + 3] != null) {
+                            return true;
+                        }
+                        // Next part was a directory (leaf == null) so skip it
+                        idx += 2;
+                    }
+                    return false;
+                }
+
+                @Override
+                public String next() {
+                    if (!hasNext()) {
+                        throw new NoSuchElementException();
+                    }
+
+                    idx += 2;
+                    String branch = paths[idx];
+                    String leaf = paths[idx + 1];
+
+                    if (branch == null) {
+                        return leaf;
+                    } else if (leaf == null) {
+                        return branch;
+                    } else {
+                        return branch + leaf;
+                    }
+                }
+            };
+        }
+
+        private static String intern(String str, Map<String, String> internCache) {
+            String result = internCache.get(str);
+            if (result == null) {
+                internCache.put(str, str);
+                result = str;
+            }
+            return result;
         }
     }
 }
