@@ -28,6 +28,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
+import java.lang.ref.WeakReference;
 import java.net.MalformedURLException;
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -66,7 +67,16 @@ final class JarFileResourceLoader extends AbstractResourceLoader implements Iter
     private final URL rootUrl;
     private final String relativePath;
     private final File fileOfJar;
-    private final List<String> directory;
+    // Cache the directory of the jar file weakly. The benefit of caching it is
+    // primarily to avoid concurrent iteration of the jar file so having it gc'd
+    // once those concurrent requests are done is ok. It hopefully wouldn't be gc'd
+    // while those concurrent requests are wanting to iterate as one or the
+    // other of the threads will have a ref to the directory. In a pathological case
+    // T2 may wait for T1 to build the directory but then it is gc'd before T2 can use
+    // it, forcing T2 to build it again. But that still may be more efficient overall
+    // vs having T1 and T2 impeding each other competing for the JarFile monitor for each
+    // hasNext/next call while trying to simultaneously iterate the JarFile.
+    private volatile WeakReference<List<String>> directoryRef;
 
     // protected by {@code this}
     private final Map<CodeSigners, CodeSource> codeSources = new HashMap<>();
@@ -95,15 +105,6 @@ final class JarFileResourceLoader extends AbstractResourceLoader implements Iter
         } catch (MalformedURLException e) {
             throw new IllegalArgumentException("Invalid root file specified", e);
         }
-        final Enumeration<JarEntry> entries = jarFile.entries();
-        List<String> directory = new ArrayList<>();
-        while (entries.hasMoreElements()) {
-            final JarEntry jarEntry = entries.nextElement();
-            if (! jarEntry.isDirectory()) {
-                directory.add(jarEntry.getName());
-            }
-        }
-        this.directory = directory;
     }
 
     private static URI getJarURI(final URI original, final String nestedPath) throws URISyntaxException {
@@ -258,7 +259,7 @@ final class JarFileResourceLoader extends AbstractResourceLoader implements Iter
     public Iterator<Resource> iterateResources(String startPath, final boolean recursive) {
         if (relativePath != null) startPath = startPath.equals("") ? relativePath : relativePath + "/" + startPath;
         final String startName = PathUtils.canonicalize(PathUtils.relativize(startPath));
-        final Iterator<String> iterator = directory.iterator();
+        final Iterator<String> iterator = getDirectoryIterator();
         return new Iterator<Resource>() {
             private Resource next;
 
@@ -293,6 +294,30 @@ final class JarFileResourceLoader extends AbstractResourceLoader implements Iter
                 throw new UnsupportedOperationException();
             }
         };
+    }
+
+    private Iterator<String> getDirectoryIterator() {
+        final WeakReference<List<String>> dirRef = this.directoryRef;
+        List<String> directory = dirRef == null ? null : dirRef.get();
+        if (directory == null) {
+            synchronized (this) {
+                // Try again in case it was cached while we blocked on this monitor
+                directory = this.directoryRef == null ? null : this.directoryRef.get();
+                if (directory == null) {
+                    directory = new ArrayList<>();
+                    final JarFile jarFile = this.jarFile;
+                    final Enumeration<JarEntry> entries = jarFile.entries();
+                    while (entries.hasMoreElements()) {
+                        final JarEntry jarEntry = entries.nextElement();
+                        if (!jarEntry.isDirectory()) {
+                            directory.add(jarEntry.getName());
+                        }
+                    }
+                    this.directoryRef = new WeakReference<>(directory);
+                }
+            }
+        }
+        return directory.iterator();
     }
 
     public Collection<String> getPaths() {
@@ -356,6 +381,9 @@ final class JarFileResourceLoader extends AbstractResourceLoader implements Iter
     static void extractJarPaths(final JarFile jarFile, String relativePath,
             final Collection<String> index) {
         index.add("");
+        // TODO consider using getDirectoryIterator() for this as the weakly cached directory
+        // may then be usable by a call to iterateResources(), if it's not gc'd in between.
+        // The directory it creates excludes directories though.
         final Enumeration<JarEntry> entries = jarFile.entries();
         while (entries.hasMoreElements()) {
             final JarEntry jarEntry = entries.nextElement();
